@@ -2,9 +2,13 @@ package raft
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
+	"net"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
 type RaftNode struct {
@@ -45,7 +49,9 @@ type RaftNode struct {
 	// Persistent storage interface
 	storage Storage
 
-	// TODO: Add networking fields (RPC clients/servers) here
+	grpcClients  map[uint64]RaftServiceClient // gRPC客户端，key是Peer ID
+	grpcServer   *grpc.Server                 // gRPC服务端实例
+	grpcListener net.Listener                 // 监听器，绑定服务端端口
 }
 
 func randTimeout(min, max time.Duration, defaults ...bool) time.Duration {
@@ -121,14 +127,142 @@ func (rn *RaftNode) resetElectionTimer() {
 	rn.electionTimer.Reset(rn.electionTimeout)
 }
 
-func (rn *RaftNode) startElection() {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
+func (rn *RaftNode) becomeCandidate() {
 	rn.currentTerm++
 	rn.state = Candidate
 	rn.votedFor = rn.id
-	// TODO: 实现 RequestVote 广播逻辑
-	println("Node", rn.id, "starts election at term", rn.currentTerm)
+}
+
+func (rn *RaftNode) getLastLogInfo() (lastLogIndex uint64, lastLogTerm uint64) {
+	if len(rn.log) == 0 {
+		return 0, 0
+	}
+	lastEntry := rn.log[len(rn.log)-1]
+	return lastEntry.LogIndex, lastEntry.LogTerm
+}
+
+func (rn *RaftNode) getLastLogIndex() (lastLogIndex uint64) {
+	if len(rn.log) == 0 {
+		return 0
+	}
+	lastEntry := rn.log[len(rn.log)-1]
+	return lastEntry.LogIndex
+}
+
+func (rn *RaftNode) becomeLeader() {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	rn.state = Leader
+	// 初始化 leader 特有状态
+	for peerID := range rn.peers {
+		rn.nextIndex[peerID] = rn.getLastLogIndex() + 1
+		rn.matchIndex[peerID] = 0
+	}
+	log.Printf("Node %d becomes Leader for term %d", rn.id, rn.currentTerm)
+}
+
+func (rn *RaftNode) becomeFollower() {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	rn.state = Follower
+	rn.votedFor = 0
+	log.Printf("Node %d becomes Follower for term %d", rn.id, rn.currentTerm)
+}
+
+func (rn *RaftNode) startElection() {
+	rn.mu.Lock()
+	rn.becomeCandidate()
+	lastLogIndex, lastLogTerm := rn.getLastLogInfo()
+	currentTerm := rn.currentTerm
+	rn.mu.Unlock()
+	votes := rn.collectVotes(currentTerm, lastLogIndex, lastLogTerm)
+	if votes > (len(rn.peers)+1)/2 {
+		rn.becomeLeader()
+	} else {
+		rn.becomeFollower()
+	}
+}
+
+func (rn *RaftNode) collectVotes(term, lastLogIndex, lastLogTerm uint64) int {
+	voteCount := 1 // 自己先投票
+	totalNodes := len(rn.peers) + 1
+
+	voteCh := make(chan struct{}, 1)
+	var mu sync.Mutex
+
+	electionDone := false
+
+	for peerID, addr := range rn.peers {
+		go func(peerID uint64, addr string) {
+			req := RequestVoteRequest{
+				Term:         term,
+				CandidateID:  rn.id,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			}
+			resp, err := rn.sendRequestVote(addr, req)
+			if err != nil {
+				log.Printf("RequestVote RPC to peer %d failed: %v", peerID, err)
+				return
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if electionDone {
+				return
+			}
+			if resp.VoteGranted {
+				voteCount++
+				if voteCount >= totalNodes/2+1 && !electionDone {
+					electionDone = true
+					select {
+					case voteCh <- struct{}{}:
+					default:
+					}
+				}
+				log.Printf("Node %d voted for candidate %d in term %d", peerID, req.CandidateID, term)
+			} else {
+				log.Printf("Node %d did not vote for candidate %d in term %d", peerID, req.CandidateID, term)
+			}
+		}(peerID, addr)
+	}
+
+	timeout := time.After(300 * time.Millisecond)
+
+	for {
+		mu.Lock()
+		done := electionDone
+		mu.Unlock()
+
+		if done {
+			break
+		}
+
+		select {
+		case <-voteCh:
+			// 收到通知，继续检查
+		case <-timeout:
+			// 超时，结束选举
+			mu.Lock()
+			electionDone = true
+			mu.Unlock()
+		}
+	}
+	return voteCount
+}
+
+func (rn *RaftNode) sendRequestVote(addr string, req RequestVoteRequest) (*RequestVoteResponse, error) {
+	maxRetries := 3
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		resp, err := rn.rpcClients[addr].SendRequestVote(&req)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		time.Sleep(time.Duration(50*(i+1)) * time.Millisecond) // 指数退避或固定间隔
+	}
+	return nil, fmt.Errorf("sendRequestVote failed after %d retries: %v", maxRetries, lastErr)
 }
 
 func (rn *RaftNode) runElectionTimer() {
