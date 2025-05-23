@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"github.com/llboyfy/MiniRaftDB/pkg/raftpb"
 )
 
 // 持久化接口
 type Storage interface {
-	AppendLog(entry RaftLogEntry) error
-	LoadLogs() ([]RaftLogEntry, error)
+	AppendLog(entry raftpb.RaftLogEntry) error
+	LoadLogs() ([]raftpb.RaftLogEntry, error)
 }
 
 // 简单文件持久化实现
@@ -28,7 +30,7 @@ func NewFileStorage(filePath string) (*FileStorage, error) {
 }
 
 // 追加日志条目到文件
-func (fs *FileStorage) AppendLog(entry RaftLogEntry) error {
+func (fs *FileStorage) AppendLog(entry raftpb.RaftLogEntry) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -45,7 +47,7 @@ func (fs *FileStorage) AppendLog(entry RaftLogEntry) error {
 }
 
 // 加载所有日志条目
-func (fs *FileStorage) LoadLogs() ([]RaftLogEntry, error) {
+func (fs *FileStorage) LoadLogs() ([]raftpb.RaftLogEntry, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -54,9 +56,9 @@ func (fs *FileStorage) LoadLogs() ([]RaftLogEntry, error) {
 	}
 
 	scanner := bufio.NewScanner(fs.file)
-	logs := make([]RaftLogEntry, 0)
+	logs := make([]raftpb.RaftLogEntry, 0)
 	for scanner.Scan() {
-		var entry RaftLogEntry
+		var entry raftpb.RaftLogEntry
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal log entry: %v", err)
 		}

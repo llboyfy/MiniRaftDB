@@ -1,11 +1,17 @@
 package raft
 
-type RaftLogEntry struct {
-	LogIndex      uint64             // Log index, strictly increasing and unique
-	LogTerm       uint64             // Term number for Raft consistency
-	EntryType     RaftLogEntryType   // Protocol-level log entry type (data, txn begin/commit/rollback, config change)
-	OperationType RaftLogCommandType // Business operation type (set, delete)
-	TransactionID string             // Transaction ID, empty if not part of a transaction
-	DataKey       string             // Business key
-	DataValue     []byte             // Business value
+func (rn *RaftNode) getLastLogInfo() (lastLogIndex uint64, lastLogTerm uint64) {
+	if len(rn.log) == 0 {
+		return 0, 0
+	}
+	lastEntry := &rn.log[len(rn.log)-1] // 使用指针，避免复制锁
+	return lastEntry.LogIndex, lastEntry.LogTerm
+}
+
+func (rn *RaftNode) getLastLogIndex() uint64 {
+	if len(rn.log) == 0 {
+		return 0
+	}
+	lastEntry := &rn.log[len(rn.log)-1] // 使用指针
+	return lastEntry.LogIndex
 }

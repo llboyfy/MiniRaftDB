@@ -3,11 +3,12 @@ package raft
 import (
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/llboyfy/MiniRaftDB/pkg/raftpb"
+	"github.com/llboyfy/MiniRaftDB/raft/base"
 	"google.golang.org/grpc"
 )
 
@@ -15,9 +16,9 @@ type RaftNode struct {
 	mu    sync.Mutex     // protects all following fields
 	state RaftNodeStatus // node current role/state
 	// Persistent state on all servers
-	currentTerm uint64         // latest term server has seen
-	votedFor    uint64         // candidateId that received vote in current term (0 means none)
-	log         []RaftLogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader
+	currentTerm uint64                // latest term server has seen
+	votedFor    uint64                // candidateId that received vote in current term (0 means none)
+	log         []raftpb.RaftLogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader
 
 	// Volatile state on all servers
 	commitIndex  uint64 // index of highest log entry known to be committed
@@ -40,8 +41,8 @@ type RaftNode struct {
 	heartbeatTimer   *time.Timer
 
 	// Channels for internal coordination
-	applyCh   chan RaftLogEntry // channel to apply committed log entries to state machine
-	applyCond *sync.Cond        // condition variable for signaling log application
+	applyCh   chan raftpb.RaftLogEntry // channel to apply committed log entries to state machine
+	applyCond *sync.Cond               // condition variable for signaling log application
 	// test
 	stopCh      chan struct{} // signal to stop goroutines
 	heartbeatCh chan struct{} // signal to trigger heartbeat immediately
@@ -49,27 +50,19 @@ type RaftNode struct {
 	// Persistent storage interface
 	storage Storage
 
-	grpcClients  map[uint64]RaftServiceClient // gRPC客户端，key是Peer ID
-	grpcServer   *grpc.Server                 // gRPC服务端实例
-	grpcListener net.Listener                 // 监听器，绑定服务端端口
+	grpcClients  map[uint64]raftpb.RaftServiceClient // gRPC客户端，key是Peer ID
+	grpcServer   *grpc.Server                        // gRPC服务端实例
+	grpcListener net.Listener                        // 监听器，绑定服务端端口
 }
 
-func randTimeout(min, max time.Duration, defaults ...bool) time.Duration {
-	if len(defaults) > 0 && defaults[0] {
-		min = 150 * time.Millisecond
-		max = 300 * time.Millisecond
-	}
-	return min + time.Duration(rand.Int63n(int64(max-min)))
-}
-
-func NewRaftNode(id uint64, peers map[uint64]string, applyCh chan RaftLogEntry, storage Storage) (*RaftNode, error) {
+func NewRaftNode(id uint64, peers map[uint64]string, applyCh chan raftpb.RaftLogEntry, storage Storage) (*RaftNode, error) {
 	rn := &RaftNode{
 		id:               id,
 		peers:            peers,
 		state:            Follower,
 		currentTerm:      0,
 		votedFor:         0, // 0 表示未投票
-		log:              make([]RaftLogEntry, 0),
+		log:              make([]raftpb.RaftLogEntry, 0),
 		commitIndex:      0,
 		lastApplied:      0,
 		nextIndex:        make(map[uint64]uint64),
@@ -123,7 +116,7 @@ func (rn *RaftNode) resetElectionTimer() {
 		default:
 		}
 	}
-	rn.electionTimeout = randTimeout(0, 0, true) // 动态超时避免选举冲突
+	rn.electionTimeout = base.RandTimeout(0, 0, true) // 动态超时避免选举冲突
 	rn.electionTimer.Reset(rn.electionTimeout)
 }
 
@@ -131,22 +124,6 @@ func (rn *RaftNode) becomeCandidate() {
 	rn.currentTerm++
 	rn.state = Candidate
 	rn.votedFor = rn.id
-}
-
-func (rn *RaftNode) getLastLogInfo() (lastLogIndex uint64, lastLogTerm uint64) {
-	if len(rn.log) == 0 {
-		return 0, 0
-	}
-	lastEntry := rn.log[len(rn.log)-1]
-	return lastEntry.LogIndex, lastEntry.LogTerm
-}
-
-func (rn *RaftNode) getLastLogIndex() (lastLogIndex uint64) {
-	if len(rn.log) == 0 {
-		return 0
-	}
-	lastEntry := rn.log[len(rn.log)-1]
-	return lastEntry.LogIndex
 }
 
 func (rn *RaftNode) becomeLeader() {
@@ -187,82 +164,53 @@ func (rn *RaftNode) collectVotes(term, lastLogIndex, lastLogTerm uint64) int {
 	voteCount := 1 // 自己先投票
 	totalNodes := len(rn.peers) + 1
 
-	voteCh := make(chan struct{}, 1)
-	var mu sync.Mutex
+	voteCh := make(chan bool, len(rn.peers))
 
-	electionDone := false
+	req := &raftpb.RequestVoteRequest{
+		Term:         term,
+		CandidateID:  rn.id,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
 
-	for peerID, addr := range rn.peers {
-		go func(peerID uint64, addr string) {
-			req := RequestVoteRequest{
-				Term:         term,
-				CandidateID:  rn.id,
-				LastLogIndex: lastLogIndex,
-				LastLogTerm:  lastLogTerm,
-			}
-			resp, err := rn.sendRequestVote(addr, req)
+	for peerID, _ := range rn.peers {
+		if peerID == rn.id {
+			continue
+		}
+		go func(peerID uint64) {
+			granted, err := rn.requestVoteOnce(peerID, req)
 			if err != nil {
 				log.Printf("RequestVote RPC to peer %d failed: %v", peerID, err)
+				voteCh <- false
 				return
 			}
-
-			mu.Lock()
-			defer mu.Unlock()
-			if electionDone {
-				return
-			}
-			if resp.VoteGranted {
-				voteCount++
-				if voteCount >= totalNodes/2+1 && !electionDone {
-					electionDone = true
-					select {
-					case voteCh <- struct{}{}:
-					default:
-					}
-				}
-				log.Printf("Node %d voted for candidate %d in term %d", peerID, req.CandidateID, term)
+			if granted {
+				log.Printf("Node %d voted for candidate %d in term %d", peerID, rn.id, term)
+				voteCh <- true
 			} else {
-				log.Printf("Node %d did not vote for candidate %d in term %d", peerID, req.CandidateID, term)
+				log.Printf("Node %d did not vote for candidate %d in term %d", peerID, rn.id, term)
+				voteCh <- false
 			}
-		}(peerID, addr)
+		}(peerID)
 	}
 
 	timeout := time.After(300 * time.Millisecond)
+	neededVotes := totalNodes/2 + 1
 
-	for {
-		mu.Lock()
-		done := electionDone
-		mu.Unlock()
-
-		if done {
-			break
-		}
-
+	for received := 1; received < totalNodes; received++ {
 		select {
-		case <-voteCh:
-			// 收到通知，继续检查
+		case v := <-voteCh:
+			if v {
+				voteCount++
+				if voteCount >= neededVotes {
+					return voteCount // 提前返回
+				}
+			}
 		case <-timeout:
-			// 超时，结束选举
-			mu.Lock()
-			electionDone = true
-			mu.Unlock()
+			return voteCount
 		}
 	}
 	return voteCount
-}
-
-func (rn *RaftNode) sendRequestVote(addr string, req RequestVoteRequest) (*RequestVoteResponse, error) {
-	maxRetries := 3
-	var lastErr error
-	for i := 0; i < maxRetries; i++ {
-		resp, err := rn.rpcClients[addr].SendRequestVote(&req)
-		if err == nil {
-			return resp, nil
-		}
-		lastErr = err
-		time.Sleep(time.Duration(50*(i+1)) * time.Millisecond) // 指数退避或固定间隔
-	}
-	return nil, fmt.Errorf("sendRequestVote failed after %d retries: %v", maxRetries, lastErr)
 }
 
 func (rn *RaftNode) runElectionTimer() {

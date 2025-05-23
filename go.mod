@@ -1,4 +1,4 @@
-module your_module_name
+module github.com/llboyfy/MiniRaftDB
 
 go 1.23
 
