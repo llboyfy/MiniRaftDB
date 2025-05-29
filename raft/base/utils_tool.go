@@ -12,3 +12,15 @@ func RandTimeout(min, max time.Duration, defaults ...bool) time.Duration {
 	}
 	return min + time.Duration(rand.Int63n(int64(max-min)))
 }
+
+func SafeClose(ch *chan struct{}) {
+	if *ch != nil {
+		select {
+		case <-*ch:
+			// Already closed
+		default:
+			close(*ch)
+		}
+		*ch = nil // Mark as closed
+	}
+}

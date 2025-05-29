@@ -12,7 +12,7 @@ import (
 // 持久化接口
 type Storage interface {
 	AppendLog(entry raftpb.RaftLogEntry) error
-	LoadLogs() ([]raftpb.RaftLogEntry, error)
+	LoadLogs() ([]*raftpb.RaftLogEntry, error)
 }
 
 // 简单文件持久化实现
@@ -47,7 +47,7 @@ func (fs *FileStorage) AppendLog(entry raftpb.RaftLogEntry) error {
 }
 
 // 加载所有日志条目
-func (fs *FileStorage) LoadLogs() ([]raftpb.RaftLogEntry, error) {
+func (fs *FileStorage) LoadLogs() ([]*raftpb.RaftLogEntry, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 

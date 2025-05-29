@@ -16,9 +16,9 @@ type RaftNode struct {
 	mu    sync.Mutex     // protects all following fields
 	state RaftNodeStatus // node current role/state
 	// Persistent state on all servers
-	currentTerm uint64                // latest term server has seen
-	votedFor    uint64                // candidateId that received vote in current term (0 means none)
-	log         []raftpb.RaftLogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader
+	currentTerm uint64                 // latest term server has seen
+	votedFor    uint64                 // candidateId that received vote in current term (0 means none)
+	log         []*raftpb.RaftLogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader
 
 	// Volatile state on all servers
 	commitIndex  uint64 // index of highest log entry known to be committed
@@ -46,6 +46,7 @@ type RaftNode struct {
 	// test
 	stopCh      chan struct{} // signal to stop goroutines
 	heartbeatCh chan struct{} // signal to trigger heartbeat immediately
+	replicateCh chan struct{}
 
 	// Persistent storage interface
 	storage Storage
@@ -62,7 +63,7 @@ func NewRaftNode(id uint64, peers map[uint64]string, applyCh chan raftpb.RaftLog
 		state:            Follower,
 		currentTerm:      0,
 		votedFor:         0, // 0 表示未投票
-		log:              make([]raftpb.RaftLogEntry, 0),
+		log:              make([]*raftpb.RaftLogEntry, 0),
 		commitIndex:      0,
 		lastApplied:      0,
 		nextIndex:        make(map[uint64]uint64),
@@ -128,22 +129,30 @@ func (rn *RaftNode) becomeCandidate() {
 
 func (rn *RaftNode) becomeLeader() {
 	rn.mu.Lock()
-	defer rn.mu.Unlock()
 	rn.state = Leader
 	// 初始化 leader 特有状态
 	for peerID := range rn.peers {
 		rn.nextIndex[peerID] = rn.getLastLogIndex() + 1
 		rn.matchIndex[peerID] = 0
 	}
+	base.SafeClose(&rn.stopCh) // 停止选举定时器
+	rn.stopCh = make(chan struct{})
 	log.Printf("Node %d becomes Leader for term %d", rn.id, rn.currentTerm)
+	rn.mu.Unlock()
+	go rn.runHeartbeatTimer()
+
 }
 
 func (rn *RaftNode) becomeFollower() {
 	rn.mu.Lock()
-	defer rn.mu.Unlock()
 	rn.state = Follower
 	rn.votedFor = 0
+	base.SafeClose(&rn.stopCh) // 停止心跳
+	rn.stopCh = make(chan struct{})
 	log.Printf("Node %d becomes Follower for term %d", rn.id, rn.currentTerm)
+
+	rn.mu.Unlock()
+	go rn.runElectionTimer()
 }
 
 func (rn *RaftNode) startElection() {
@@ -224,6 +233,106 @@ func (rn *RaftNode) runElectionTimer() {
 			rn.resetElectionTimer()
 		case <-rn.stopCh:
 			return
+		}
+	}
+}
+
+func (rn *RaftNode) runHeartbeatTimer() {
+	ticker := time.NewTicker(rn.heartbeatTimeout)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			rn.sendHeartbeats()
+		case <-rn.stopCh:
+			return
+		}
+	}
+}
+
+func (rn *RaftNode) sendHeartbeats() {
+	rn.mu.Lock()
+	if rn.state != Leader {
+		rn.mu.Unlock()
+		return
+	}
+	currentTerm := rn.currentTerm
+	commitIndex := rn.commitIndex
+	peers := make([]uint64, 0, len(rn.peers))
+	for peerID := range rn.peers {
+		if peerID != rn.id {
+			peers = append(peers, peerID)
+		}
+	}
+	rn.mu.Unlock()
+
+	for _, peerID := range peers {
+		go rn.sendHeartbeatToPeer(peerID, currentTerm, commitIndex)
+	}
+}
+
+func (rn *RaftNode) sendHeartbeatToPeer(peerID uint64, currentTerm, commitIndex uint64) {
+	req := rn.buildAppendEntriesRequest(peerID, currentTerm, commitIndex)
+	resp, err := rn.sendAppendEntries(peerID, req)
+	rn.handleAppendEntriesResponse(peerID, req, resp, err)
+}
+
+func (rn *RaftNode) buildAppendEntriesRequest(peerID, currentTerm, commitIndex uint64) *raftpb.AppendEntriesRequest {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	prevLogIndex := rn.nextIndex[peerID] - 1
+	prevLogTerm := uint64(0)
+	if prevLogIndex > 0 && int(prevLogIndex) <= len(rn.log) {
+		if entry := rn.log[prevLogIndex-1]; entry != nil {
+			prevLogTerm = entry.LogTerm
+		}
+	}
+	var entries []*raftpb.RaftLogEntry
+	for i := prevLogIndex; i < uint64(len(rn.log)); i++ {
+		if rn.log[i] != nil {
+			entries = append(entries, rn.log[i])
+		}
+	}
+
+	return &raftpb.AppendEntriesRequest{
+		Term:         currentTerm,
+		LeaderID:     rn.id,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: commitIndex,
+	}
+}
+
+func (rn *RaftNode) handleAppendEntriesResponse(peerID uint64, req *raftpb.AppendEntriesRequest, resp *raftpb.AppendEntriesResponse, err error) {
+	if err != nil {
+		// 日志/监控，什么都不做，等下一轮 tick 自动重试
+		fmt.Printf("AppendEntries to peer %d failed: %v\n", peerID, err)
+		return
+	}
+	if resp == nil {
+		fmt.Printf("No response from peer %d\n", peerID)
+		return
+	}
+
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if resp.Term > rn.currentTerm {
+		rn.currentTerm = resp.Term
+		rn.becomeFollower()
+		return
+	}
+	if rn.state != Leader {
+		return
+	}
+	if resp.Success {
+		rn.matchIndex[peerID] = req.PrevLogIndex + uint64(len(req.Entries))
+		rn.nextIndex[peerID] = rn.matchIndex[peerID] + 1
+		// 可选：推进 commitIndex
+	} else {
+		if rn.nextIndex[peerID] > 1 {
+			rn.nextIndex[peerID]--
 		}
 	}
 }

@@ -7,7 +7,7 @@ import (
 	"github.com/llboyfy/MiniRaftDB/pkg/raftpb"
 )
 
-func (rn *RaftNode) HandleRequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
+func (rn *RaftNode) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
@@ -53,6 +53,43 @@ func (rn *RaftNode) HandleRequestVote(ctx context.Context, req *raftpb.RequestVo
 	// rn.persistState()
 
 	return resp, nil
+}
+
+func (rn *RaftNode) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
+	// 1. 收到 leader 的心跳或日志复制，重置选举定时器
+	select {
+	case rn.heartbeatCh <- struct{}{}:
+	default:
+	}
+
+	// 2. 对请求进行 term 检查、状态转换、日志一致性检查与写入、commitIndex 更新等
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	// 如果 leader 任期过旧，拒绝
+	if req.Term < rn.currentTerm {
+		return &raftpb.AppendEntriesResponse{
+			Term:    rn.currentTerm,
+			Success: false,
+		}, nil
+	}
+
+	// 如果发现自己是 candidate 或 leader，降级为 follower
+	if req.Term > rn.currentTerm {
+		rn.currentTerm = req.Term
+		rn.votedFor = 0
+		rn.state = Follower
+	}
+
+	// 日志一致性检查：确认 prevLogIndex/prevLogTerm 匹配
+	// 然后追加新条目，或者在冲突时删除冲突后的条目
+	// 更新 commitIndex = min(req.LeaderCommit, len(rn.log))
+
+	// 返回成功
+	return &raftpb.AppendEntriesResponse{
+		Term:    rn.currentTerm,
+		Success: true,
+	}, nil
 }
 
 func (rn *RaftNode) requestVoteOnce(peerID uint64, req *raftpb.RequestVoteRequest) (bool, error) {
