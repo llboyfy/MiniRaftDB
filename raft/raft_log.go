@@ -15,3 +15,13 @@ func (rn *RaftNode) getLastLogIndex() uint64 {
 	lastEntry := rn.log[len(rn.log)-1] // 使用指针
 	return lastEntry.LogIndex
 }
+
+func (rn *RaftNode) findLastIndexOfTerm(targetTerm uint64) uint64 {
+	// 从日志末尾向前扫描
+	for i := len(rn.log) - 1; i >= 0; i-- {
+		if rn.log[i].LogTerm == targetTerm {
+			return uint64(i + 1) // 日志索引是 1-based
+		}
+	}
+	return 0
+}

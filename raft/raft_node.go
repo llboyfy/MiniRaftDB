@@ -128,7 +128,6 @@ func (rn *RaftNode) becomeCandidate() {
 }
 
 func (rn *RaftNode) becomeLeader() {
-	rn.mu.Lock()
 	rn.state = Leader
 	// 初始化 leader 特有状态
 	for peerID := range rn.peers {
@@ -138,20 +137,18 @@ func (rn *RaftNode) becomeLeader() {
 	base.SafeClose(&rn.stopCh) // 停止选举定时器
 	rn.stopCh = make(chan struct{})
 	log.Printf("Node %d becomes Leader for term %d", rn.id, rn.currentTerm)
-	rn.mu.Unlock()
+
 	go rn.runHeartbeatTimer()
 
 }
 
 func (rn *RaftNode) becomeFollower() {
-	rn.mu.Lock()
 	rn.state = Follower
 	rn.votedFor = 0
 	base.SafeClose(&rn.stopCh) // 停止心跳
 	rn.stopCh = make(chan struct{})
 	log.Printf("Node %d becomes Follower for term %d", rn.id, rn.currentTerm)
 
-	rn.mu.Unlock()
 	go rn.runElectionTimer()
 }
 
@@ -162,11 +159,13 @@ func (rn *RaftNode) startElection() {
 	currentTerm := rn.currentTerm
 	rn.mu.Unlock()
 	votes := rn.collectVotes(currentTerm, lastLogIndex, lastLogTerm)
+	rn.mu.Lock()
 	if votes > (len(rn.peers)+1)/2 {
 		rn.becomeLeader()
 	} else {
 		rn.becomeFollower()
 	}
+	rn.mu.Unlock()
 }
 
 func (rn *RaftNode) collectVotes(term, lastLogIndex, lastLogTerm uint64) int {
@@ -327,12 +326,66 @@ func (rn *RaftNode) handleAppendEntriesResponse(peerID uint64, req *raftpb.Appen
 		return
 	}
 	if resp.Success {
-		rn.matchIndex[peerID] = req.PrevLogIndex + uint64(len(req.Entries))
-		rn.nextIndex[peerID] = rn.matchIndex[peerID] + 1
-		// 可选：推进 commitIndex
+		rn.matchIndex[peerID] = resp.MatchIndex
+		rn.nextIndex[peerID] = resp.MatchIndex + 1
+		if len(req.Entries) > 0 && resp.MatchIndex > rn.commitIndex {
+			rn.advanceCommitIndex()
+		}
 	} else {
+		rn.adjustNextIndex(peerID, resp)
+	}
+}
+
+// 根据 follower 返回的 ConflictIndex/ConflictTerm 调整 nextIndex
+func (rn *RaftNode) adjustNextIndex(peerID uint64, resp *raftpb.AppendEntriesResponse) {
+	// 如果 follower 没给出有效的 ConflictIndex，直接不处理
+	newNext := resp.ConflictIndex
+	if newNext == 0 {
+		// fallback：简单减一保证进度
 		if rn.nextIndex[peerID] > 1 {
 			rn.nextIndex[peerID]--
 		}
+		return
+	}
+
+	// 如果同时给出了 ConflictTerm，就尝试把回退点移到本地相同 term 的最后一条日志之后
+	if resp.ConflictTerm > 0 {
+		if lastIdx := rn.findLastIndexOfTerm(resp.ConflictTerm); lastIdx > 0 {
+			newNext = lastIdx + 1
+		}
+	}
+
+	// 最终设置
+	rn.nextIndex[peerID] = newNext
+}
+
+func (rn *RaftNode) advanceCommitIndex() {
+	oldCommit := rn.commitIndex
+	lastIdx := rn.getLastLogIndex()
+	majority := (len(rn.peers)+1)/2 + 1
+
+	// 只推进到当前 leader 任期内的 log
+	for N := rn.commitIndex + 1; N <= lastIdx; N++ {
+		// Raft 要求只能提交当前任期的日志，保证线性一致性读
+		if rn.log[N-1].LogTerm != rn.currentTerm {
+			continue
+		}
+		// 统计自己 + followers 中有多少 matchIndex ≥ N
+		cnt := 1 // 自己
+		for _, mi := range rn.matchIndex {
+			if mi >= N {
+				cnt++
+			}
+		}
+		// 如果多数 peer（含 leader）都已复制
+		if cnt >= majority {
+			rn.commitIndex = N
+		} else {
+			// 后面的 N 越来越大，如果这个 N 都不够多数，那更大的是不是更不够？
+			break
+		}
+	}
+	if rn.commitIndex > oldCommit {
+		rn.applyCond.Broadcast()
 	}
 }

@@ -39,6 +39,9 @@ message AppendEntriesResponse {
   uint64 term = 1;
   bool success = 2;
   uint64 matchIndex = 3; // 可选，返回最后匹配的日志索引
+  uint64 conflictIndex  = 4;  // follower 日志中首次冲突或缺失的索引
+  uint64 conflictTerm   = 5;  // 上一条冲突日志的任期值
+
 }
 
 // 日志条目类型
