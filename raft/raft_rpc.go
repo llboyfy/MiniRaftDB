@@ -5,9 +5,10 @@ import (
 	"time"
 
 	"github.com/llboyfy/MiniRaftDB/pkg/raftpb"
+	"google.golang.org/grpc"
 )
 
-func (rn *RaftNode) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
+func (rn *RaftNode) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest, opts ...grpc.CallOption) (*raftpb.RequestVoteResponse, error) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
@@ -56,10 +57,7 @@ func (rn *RaftNode) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequ
 }
 
 // AppendEntries 处理来自 leader 的心跳和日志复制请求
-func (rn *RaftNode) AppendEntries(
-	ctx context.Context,
-	req *raftpb.AppendEntriesRequest,
-) (*raftpb.AppendEntriesResponse, error) {
+func (rn *RaftNode) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest, opts ...grpc.CallOption) (*raftpb.AppendEntriesResponse, error) {
 	// 1. 收到心跳或日志复制请求，重置选举定时器
 	select {
 	case rn.heartbeatCh <- struct{}{}:
